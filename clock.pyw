@@ -7,9 +7,27 @@ import winsound
 import os
 import random
 import tkinter as tk
+from urllib import parse, request
 from tkinter import simpledialog
+from datetime import datetime, timedelta
 from pynput import keyboard, mouse
 import pyautogui
+import ctypes
+
+
+def load_local_env(path):
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+load_local_env(os.path.join(os.path.dirname(__file__), ".env"))
 
 FILE_STORAGE = "clock.json"
 START_STOP_KEY = "`"
@@ -19,9 +37,261 @@ TIMER_KEY = keyboard.Key.ctrl_r
 EXIT_KEY = keyboard.Key.esc
 WIDTH, HEIGHT = pyautogui.size()
 
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+IDLE_THRESHOLD_SECONDS = int(os.getenv("IDLE_THRESHOLD_SECONDS", "300"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+LAST_TELEGRAM_CHAT_ID = ""
+PENDING_ALERTS = []
+
 pyautogui.PAUSE = 0.001
 pyautogui.FAILSAFE = True
 
+
+# ============================================================== idle detection ==
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+def get_idle_duration():
+    lastInputInfo = LASTINPUTINFO()
+    lastInputInfo.cbSize = ctypes.sizeof(lastInputInfo)
+    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lastInputInfo))
+    millis = ctypes.windll.kernel32.GetTickCount() - lastInputInfo.dwTime
+    return millis / 1000.0
+
+
+def is_system_online():
+    flags = ctypes.c_ulong()
+    try:
+        return bool(ctypes.windll.wininet.InternetGetConnectedState(ctypes.byref(flags), 0))
+    except Exception:
+        return False
+
+
+def classify_status(idle_seconds, system_online, idle_threshold_seconds=IDLE_THRESHOLD_SECONDS):
+    if not system_online:
+        return "offline"
+    if idle_seconds >= idle_threshold_seconds:
+        return "idle"
+    return "online"
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def notify_local(title, message):
+    def show():
+        root = tk.Tk()
+        root.title(title)
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
+
+        frame = tk.Frame(root, padx=16, pady=12)
+        frame.pack()
+        tk.Label(frame, text=title, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(frame, text=message, font=("Segoe UI", 10), justify="left").pack(anchor="w", pady=(8, 0))
+
+        root.update_idletasks()
+        width = root.winfo_width()
+        height = root.winfo_height()
+        x = root.winfo_screenwidth() - width - 24
+        y = root.winfo_screenheight() - height - 80
+        root.geometry(f"+{x}+{y}")
+        root.after(6000, root.destroy)
+        root.mainloop()
+
+    threading.Thread(target=show, daemon=True).start()
+
+
+def telegram_api(method, params=None, timeout=10):
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    data = None
+    if params:
+        data = parse.urlencode(params).encode()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        with request.urlopen(request.Request(url, data=data, method="POST"), timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def send_telegram(message, chat_id=None):
+    chat_id = chat_id or TELEGRAM_CHAT_ID or LAST_TELEGRAM_CHAT_ID
+    if not chat_id:
+        return False
+    result = telegram_api("sendMessage", {"chat_id": chat_id, "text": message})
+    return bool(result and result.get("ok"))
+
+
+def flush_pending_alerts():
+    while PENDING_ALERTS:
+        message = PENDING_ALERTS[0]
+        if not send_telegram(f"📬 Missed alert delivered after reconnect\n\n{message}"):
+            return False
+        PENDING_ALERTS.pop(0)
+    return True
+
+
+def get_status_info():
+    idle_sec = get_idle_duration()
+    system_online = is_system_online()
+    status = classify_status(idle_sec, system_online)
+    last_active = datetime.now() - timedelta(seconds=idle_sec)
+
+    return {
+        "status": status,
+        "idle_seconds": idle_sec,
+        "system_online": system_online,
+        "last_active": last_active.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def format_status_message(title, result):
+    status_icons = {"online": "🟢", "idle": "🌙", "offline": "🔴"}
+    status = result["status"]
+    network = "online" if result["system_online"] else "offline"
+    network_icon = "🌐" if result["system_online"] else "📴"
+    return (
+        f"{title}\n\n"
+        f"{status_icons.get(status, '⚪')} Status: {status.upper()}\n"
+        f"⏱️ Idle time: {format_duration(result['idle_seconds'])}\n"
+        f"🕒 Last activity: {result['last_active']}\n"
+        f"{network_icon} Network: {network.upper()}"
+    )
+
+
+def start_message():
+    return (
+        "👋 Clockies is online.\n\n"
+        "I watch your computer locally and report activity changes through Telegram.\n\n"
+        "🟢 Online: network connected and recent keyboard/mouse activity\n"
+        "🌙 Idle: no keyboard/mouse activity for 5+ minutes\n"
+        "🔴 Offline: network disconnected\n\n"
+        "I only reply to commands, plus automatic alerts when your status changes."
+    )
+
+
+def help_message():
+    return (
+        "🧭 Commands\n\n"
+        "/start - Show what this bot does\n"
+        "/help - Show this command list\n"
+        "/status - Show current computer status"
+    )
+
+
+# ============================================================= monitor thread ==
+
+class StatusMonitor:
+    def __init__(self):
+        self.previous_status = None
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        while self.running:
+            result = get_status_info()
+            current = result["status"]
+            if self.previous_status is not None and current != self.previous_status:
+                self._notify_change(self.previous_status, result)
+            self.previous_status = current
+
+            slept = 0
+            while slept < POLL_INTERVAL_SECONDS and self.running:
+                time.sleep(1)
+                slept += 1
+
+    def _notify_change(self, old_status, result):
+        new_status = result["status"]
+        if result["system_online"]:
+            flush_pending_alerts()
+
+        message = format_status_message(f"⚠️ Clockies Alert\n{old_status.upper()} → {new_status.upper()}", result)
+        if not send_telegram(message):
+            PENDING_ALERTS.append(message)
+            notify_local("Clockies Status Change", message)
+
+
+# ============================================================= telegram bot ==
+
+class TelegramBot:
+    def __init__(self):
+        self.running = False
+        self.thread = None
+        self.offset = 0
+
+    def start(self):
+        if self.running or not TELEGRAM_BOT_TOKEN:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        while self.running:
+            result = telegram_api("getUpdates", {"offset": self.offset, "timeout": 25}, timeout=30)
+            if not result or not result.get("ok"):
+                time.sleep(5)
+                continue
+
+            for update in result.get("result", []):
+                self.offset = update["update_id"] + 1
+                self._handle_update(update)
+
+    def _handle_update(self, update):
+        global LAST_TELEGRAM_CHAT_ID
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return
+
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+            return
+        LAST_TELEGRAM_CHAT_ID = chat_id
+
+        text = (message.get("text") or "").strip().lower()
+        if text.startswith("/start"):
+            self._cmd_start(chat_id)
+        elif text.startswith("/help"):
+            self._cmd_help(chat_id)
+        elif text.startswith("/status"):
+            self._cmd_status(chat_id)
+
+    def _cmd_start(self, chat_id):
+        send_telegram(start_message(), chat_id)
+
+    def _cmd_help(self, chat_id):
+        send_telegram(help_message(), chat_id)
+
+    def _cmd_status(self, chat_id):
+        send_telegram(format_status_message("📍 Clockies Status", get_status_info()), chat_id)
+
+
+# ================================================================= clockies ==
 
 class Clockies:
     def __init__(self):
@@ -34,9 +304,10 @@ class Clockies:
         self.press_start_time = None
         self.timer_thread = None
         self.timer_active = False
+        self.monitor = StatusMonitor()
+        self.bot = TelegramBot()
         self.load_data()
 
-    # ------------------------------------------------------------------ beep --
     def beep(self, pitch):
         if pitch == "high":
             winsound.Beep(1000, 200)
@@ -53,7 +324,6 @@ class Clockies:
             winsound.Beep(700, 200)
             winsound.Beep(400, 300)
 
-    # --------------------------------------------------------------- storage --
     def save_data(self):
         with open(FILE_STORAGE, "w") as f:
             json.dump(self.actions, f)
@@ -66,12 +336,11 @@ class Clockies:
             except:
                 self.actions = []
 
-    # ------------------------------------------------------------- timer ui --
+    # --------------------------------------------------------- timer ui ----
     def show_timer_popup(self):
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-
         result = simpledialog.askstring(
             "Clockies Timer",
             "Masukkan durasi timer (menit):",
@@ -81,7 +350,6 @@ class Clockies:
 
         if result is None:
             return
-
         try:
             minutes = float(result.strip())
             if minutes <= 0:
@@ -94,23 +362,17 @@ class Clockies:
 
         self.timer_active = True
         self.beep("timer_start")
-        self.timer_thread = threading.Thread(
-            target=self._run_timer, args=(minutes,), daemon=True
-        )
+        self.timer_thread = threading.Thread(target=self._run_timer, args=(minutes,), daemon=True)
         self.timer_thread.start()
 
     def _run_timer(self, minutes):
-        seconds = minutes * 60
-        deadline = time.time() + seconds
-
+        deadline = time.time() + minutes * 60
         while time.time() < deadline:
             if not self.timer_active:
                 return
             time.sleep(0.5)
-
         if not self.timer_active:
             return
-
         self.timer_active = False
         self._stop_all_actions()
         self.beep("timer_end")
@@ -121,7 +383,7 @@ class Clockies:
         if self.autonomous:
             self.autonomous = False
 
-    # ---------------------------------------------------------- key handler --
+    # ------------------------------------------------------- key handler --
     def on_press(self, key):
         if key == EXIT_KEY:
             if self.press_start_time is None:
@@ -158,9 +420,7 @@ class Clockies:
                     return
                 self.autonomous = True
                 self.beep("high")
-                self.autonomous_thread = threading.Thread(
-                    target=self.run_autonomous, daemon=True
-                )
+                self.autonomous_thread = threading.Thread(target=self.run_autonomous, daemon=True)
                 self.autonomous_thread.start()
             else:
                 self.autonomous = False
@@ -178,7 +438,7 @@ class Clockies:
                     self.beep("exit")
                     os._exit(0)
 
-    # ------------------------------------------------------- mouse handlers --
+    # ----------------------------------------------------- mouse handlers --
     def on_move(self, x, y):
         if self.recording:
             if 0 <= x < WIDTH and 0 <= y < HEIGHT:
@@ -198,18 +458,15 @@ class Clockies:
         if self.recording:
             now = time.time()
             delay = now - self.last_time
-            self.actions.append(
-                {"type": "scroll", "x": x, "y": y, "dy": dy, "delay": delay}
-            )
+            self.actions.append({"type": "scroll", "x": x, "y": y, "dy": dy, "delay": delay})
             self.last_time = now
 
-    # ---------------------------------------------------------- play macro --
+    # -------------------------------------------------------- play macro --
     def play_macro(self):
         if not self.actions:
             return
         self.playing = True
         self.beep("high")
-
         while self.playing:
             for act in self.actions:
                 if not self.playing:
@@ -217,7 +474,6 @@ class Clockies:
                 time.sleep(act["delay"])
                 tx = min(max(0, act["x"]), WIDTH - 1)
                 ty = min(max(0, act["y"]), HEIGHT - 1)
-
                 if act["type"] == "move":
                     pyautogui.moveTo(tx, ty)
                 elif act["type"] == "click":
@@ -225,7 +481,7 @@ class Clockies:
                 elif act["type"] == "scroll":
                     pyautogui.scroll(int(act["dy"] * 100), x=tx, y=ty)
 
-    # ------------------------------------------------------- autonomous mode --
+    # ----------------------------------------------------- autonomous mode --
     def _do_random_mouse_move(self):
         margin = 50
         tx = random.randint(margin, WIDTH - margin)
@@ -291,8 +547,10 @@ class Clockies:
                 pyautogui.keyUp("alt")
                 time.sleep(random.uniform(0.2, 0.5))
 
-    # ------------------------------------------------------------------ run --
+    # ---------------------------------------------------------------- run --
     def run(self):
+        self.monitor.start()
+        self.bot.start()
         with keyboard.Listener(
             on_press=self.on_press, on_release=self.on_release
         ) as k_listener, mouse.Listener(

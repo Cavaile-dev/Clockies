@@ -1,2 +1,9 @@
 venv/
 clock.json
+.env
+__pycache__/
+extras/
+.agents/
+build/
+dist/
+clock.spec
