@@ -1,5 +1,7 @@
 ﻿#! python3.12
 
+import atexit
+import signal
 import time
 import json
 import threading
@@ -13,6 +15,12 @@ from datetime import datetime, timedelta
 from pynput import keyboard, mouse
 import pyautogui
 import ctypes
+try:
+    import pystray
+    from PIL import Image
+except ImportError:
+    pystray = None
+    Image = None
 
 
 def load_local_env(path):
@@ -46,6 +54,10 @@ PENDING_ALERTS = []
 
 pyautogui.PAUSE = 0.001
 pyautogui.FAILSAFE = True
+
+RECORD_MIN_INTERVAL_SECONDS = 0.008
+RECORD_MIN_DISTANCE_PIXELS = 2
+PLAYBACK_STOP_POLL_SECONDS = 0.02
 
 
 # ============================================================== idle detection ==
@@ -182,12 +194,22 @@ def start_message():
     )
 
 
+def online_message():
+    return "🟢 Clockies is online.\n\nClockies siap menerima command Telegram."
+
+
+def offline_message():
+    return "🔴 Clockies is offline.\n\nScript Clockies sudah berhenti."
+
+
 def help_message():
     return (
         "🧭 Commands\n\n"
         "/start - Show what this bot does\n"
         "/help - Show this command list\n"
-        "/status - Show current computer status"
+        "/status - Show current computer status\n"
+        "/play - Play recording mouse (Right Shift)\n"
+        "/stop - Stop playback recording"
     )
 
 
@@ -236,10 +258,11 @@ class StatusMonitor:
 # ============================================================= telegram bot ==
 
 class TelegramBot:
-    def __init__(self):
+    def __init__(self, clockies=None):
         self.running = False
         self.thread = None
         self.offset = 0
+        self.clockies = clockies
 
     def start(self):
         if self.running or not TELEGRAM_BOT_TOKEN:
@@ -274,12 +297,17 @@ class TelegramBot:
         LAST_TELEGRAM_CHAT_ID = chat_id
 
         text = (message.get("text") or "").strip().lower()
-        if text.startswith("/start"):
+        command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+        if command == "/start":
             self._cmd_start(chat_id)
-        elif text.startswith("/help"):
+        elif command == "/help":
             self._cmd_help(chat_id)
-        elif text.startswith("/status"):
+        elif command == "/status":
             self._cmd_status(chat_id)
+        elif command == "/play":
+            self._cmd_play(chat_id)
+        elif command == "/stop":
+            self._cmd_stop(chat_id)
 
     def _cmd_start(self, chat_id):
         send_telegram(start_message(), chat_id)
@@ -289,6 +317,14 @@ class TelegramBot:
 
     def _cmd_status(self, chat_id):
         send_telegram(format_status_message("📍 Clockies Status", get_status_info()), chat_id)
+
+    def _cmd_play(self, chat_id):
+        if self.clockies:
+            self.clockies.start_playback(chat_id)
+
+    def _cmd_stop(self, chat_id):
+        if self.clockies:
+            self.clockies.stop_playback(chat_id)
 
 
 # ================================================================= clockies ==
@@ -301,11 +337,20 @@ class Clockies:
         self.autonomous_thread = None
         self.actions = []
         self.last_time = 0
+        self.last_recorded_position = None
         self.press_start_time = None
         self.timer_thread = None
         self.timer_active = False
+        self.playback_lock = threading.Lock()
+        self.playback_stop_event = threading.Event()
+        self.keyboard_listener = None
+        self.mouse_listener = None
+        self.shutdown_lock = threading.Lock()
+        self.shutdown_started = False
+        self.lifecycle_started = False
+        self.timer_resolution_active = False
         self.monitor = StatusMonitor()
-        self.bot = TelegramBot()
+        self.bot = TelegramBot(self)
         self.load_data()
 
     def beep(self, pitch):
@@ -378,8 +423,7 @@ class Clockies:
         self.beep("timer_end")
 
     def _stop_all_actions(self):
-        if self.playing:
-            self.playing = False
+        self.stop_playback(notify=False)
         if self.autonomous:
             self.autonomous = False
 
@@ -398,7 +442,8 @@ class Clockies:
         if k == START_STOP_KEY:
             if not self.recording:
                 self.actions = []
-                self.last_time = time.time()
+                self.last_time = time.perf_counter()
+                self.last_recorded_position = None
                 self.recording = True
                 self.beep("high")
             else:
@@ -409,10 +454,9 @@ class Clockies:
         elif key == PLAY_KEY:
             if not self.recording and not self.autonomous:
                 if not self.playing:
-                    threading.Thread(target=self.play_macro, daemon=True).start()
+                    self.start_playback()
                 else:
-                    self.playing = False
-                    self.beep("low")
+                    self.stop_playback()
 
         elif key == AUTONOMOUS_KEY:
             if not self.autonomous:
@@ -436,50 +480,114 @@ class Clockies:
                 self.press_start_time = None
                 if duration >= 0.5:
                     self.beep("exit")
-                    os._exit(0)
+                    self.shutdown()
+                    return False
 
     # ----------------------------------------------------- mouse handlers --
     def on_move(self, x, y):
         if self.recording:
             if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                now = time.time()
+                now = time.perf_counter()
+                if self.last_recorded_position is not None:
+                    last_x, last_y = self.last_recorded_position
+                    distance = max(abs(x - last_x), abs(y - last_y))
+                    elapsed = now - self.last_time
+                    if (
+                        distance < RECORD_MIN_DISTANCE_PIXELS
+                        and elapsed < RECORD_MIN_INTERVAL_SECONDS
+                    ):
+                        return
                 delay = now - self.last_time
                 self.actions.append({"type": "move", "x": x, "y": y, "delay": delay})
                 self.last_time = now
+                self.last_recorded_position = (x, y)
 
     def on_click(self, x, y, button, pressed):
         if self.recording and pressed:
-            now = time.time()
+            now = time.perf_counter()
             delay = now - self.last_time
             self.actions.append({"type": "click", "x": x, "y": y, "delay": delay})
             self.last_time = now
 
     def on_scroll(self, x, y, dx, dy):
         if self.recording:
-            now = time.time()
+            now = time.perf_counter()
             delay = now - self.last_time
             self.actions.append({"type": "scroll", "x": x, "y": y, "dy": dy, "delay": delay})
             self.last_time = now
 
     # -------------------------------------------------------- play macro --
-    def play_macro(self):
-        if not self.actions:
-            return
-        self.playing = True
+    def start_playback(self, chat_id=None):
+        with self.playback_lock:
+            if self.recording or self.autonomous:
+                send_telegram("⚠️ Playback tidak bisa dimulai saat recording atau autonomous mode aktif.", chat_id)
+                return False
+            if self.playing:
+                send_telegram("ℹ️ Recording sedang play.", chat_id)
+                return False
+            if not self.actions:
+                send_telegram("⚠️ Belum ada recording mouse untuk dimainkan.", chat_id)
+                return False
+            self.playing = True
+            self.playback_stop_event.clear()
+
         self.beep("high")
-        while self.playing:
-            for act in self.actions:
-                if not self.playing:
-                    break
-                time.sleep(act["delay"])
-                tx = min(max(0, act["x"]), WIDTH - 1)
-                ty = min(max(0, act["y"]), HEIGHT - 1)
-                if act["type"] == "move":
-                    pyautogui.moveTo(tx, ty)
-                elif act["type"] == "click":
-                    pyautogui.click(tx, ty)
-                elif act["type"] == "scroll":
-                    pyautogui.scroll(int(act["dy"] * 100), x=tx, y=ty)
+        send_telegram("▶️ Recording mouse sedang play.", chat_id)
+        threading.Thread(target=self.play_macro, daemon=True).start()
+        return True
+
+    def stop_playback(self, chat_id=None, notify=True):
+        with self.playback_lock:
+            was_playing = self.playing
+            self.playing = False
+            self.playback_stop_event.set()
+
+        if was_playing:
+            self.beep("low")
+            if notify:
+                send_telegram("⏹️ Playback recording sudah stop.", chat_id)
+        elif notify:
+            send_telegram("ℹ️ Tidak ada recording yang sedang play.", chat_id)
+        return was_playing
+
+    def _wait_until_playback_deadline(self, deadline):
+        while True:
+            if self.playback_stop_event.is_set() or not self.playing:
+                return False
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return True
+            time.sleep(min(remaining, PLAYBACK_STOP_POLL_SECONDS))
+
+    def _move_cursor(self, x, y):
+        if os.name == "nt":
+            ctypes.windll.user32.SetCursorPos(x, y)
+        else:
+            pyautogui.moveTo(x, y)
+
+    def play_macro(self):
+        previous_pause = pyautogui.PAUSE
+        pyautogui.PAUSE = 0
+        try:
+            while self.playing:
+                playback_start = time.perf_counter()
+                elapsed = 0.0
+                for act in self.actions:
+                    elapsed += max(0.0, float(act.get("delay", 0)))
+                    if not self._wait_until_playback_deadline(playback_start + elapsed):
+                        break
+                    tx = min(max(0, act["x"]), WIDTH - 1)
+                    ty = min(max(0, act["y"]), HEIGHT - 1)
+                    if act["type"] == "move":
+                        self._move_cursor(tx, ty)
+                    elif act["type"] == "click":
+                        pyautogui.click(tx, ty)
+                    elif act["type"] == "scroll":
+                        pyautogui.scroll(int(act["dy"] * 100), x=tx, y=ty)
+        finally:
+            pyautogui.PAUSE = previous_pause
+            with self.playback_lock:
+                self.playing = False
 
     # ----------------------------------------------------- autonomous mode --
     def _do_random_mouse_move(self):
@@ -547,17 +655,81 @@ class Clockies:
                 pyautogui.keyUp("alt")
                 time.sleep(random.uniform(0.2, 0.5))
 
+    # --------------------------------------------------------- tray icon --
+    def _tray_icon(self):
+        if pystray is None or Image is None:
+            return
+        icon = Image.open(os.path.join(os.path.dirname(__file__), "alarm_claymorphism_red.ico"))
+        def on_exit(icon, item):
+            icon.stop()
+            self.shutdown()
+        menu = pystray.Menu(pystray.MenuItem("Exit", on_exit))
+        pystray.Icon("clockies", icon, "Clockies", menu).run()
+
+    def _begin_high_resolution_timer(self):
+        if os.name != "nt" or self.timer_resolution_active:
+            return
+        try:
+            self.timer_resolution_active = ctypes.windll.winmm.timeBeginPeriod(1) == 0
+        except (AttributeError, OSError):
+            self.timer_resolution_active = False
+
+    def _end_high_resolution_timer(self):
+        if not self.timer_resolution_active:
+            return
+        try:
+            ctypes.windll.winmm.timeEndPeriod(1)
+        finally:
+            self.timer_resolution_active = False
+
+    def shutdown(self):
+        with self.shutdown_lock:
+            if self.shutdown_started:
+                return
+            self.shutdown_started = True
+
+        self._stop_all_actions()
+        if self.lifecycle_started:
+            send_telegram(offline_message())
+        self.monitor.stop()
+        self.bot.stop()
+        if self.keyboard_listener:
+            self.keyboard_listener.stop()
+        if self.mouse_listener:
+            self.mouse_listener.stop()
+        self._end_high_resolution_timer()
+
+    def _handle_signal(self, signum, frame):
+        self.shutdown()
+
     # ---------------------------------------------------------------- run --
     def run(self):
+        atexit.register(self.shutdown)
+        self._begin_high_resolution_timer()
+        signal.signal(signal.SIGINT, self._handle_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, self._handle_signal)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, self._handle_signal)
+        threading.Thread(target=self._tray_icon, daemon=True).start()
         self.monitor.start()
         self.bot.start()
-        with keyboard.Listener(
-            on_press=self.on_press, on_release=self.on_release
-        ) as k_listener, mouse.Listener(
-            on_click=self.on_click, on_move=self.on_move, on_scroll=self.on_scroll
-        ) as m_listener:
-            k_listener.join()
-            m_listener.join()
+        self.lifecycle_started = True
+        send_telegram(online_message())
+        try:
+            with keyboard.Listener(
+                on_press=self.on_press, on_release=self.on_release
+            ) as k_listener, mouse.Listener(
+                on_click=self.on_click, on_move=self.on_move, on_scroll=self.on_scroll
+            ) as m_listener:
+                self.keyboard_listener = k_listener
+                self.mouse_listener = m_listener
+                if self.shutdown_started:
+                    k_listener.stop()
+                    m_listener.stop()
+                k_listener.join()
+        finally:
+            self.shutdown()
 
 
 if __name__ == "__main__":
